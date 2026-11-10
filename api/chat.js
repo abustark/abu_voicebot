@@ -3,18 +3,18 @@ const SYSTEM_PROMPT = "You are Abu's AI assistant. Write every answer in Abu’s
 
 export default async function handler(req, res) {
   if (req.method !== "POST") {
-    return res.status(405).json({ error: "Use POST to ask a question." });
+    return res.status(405).json({ code: "METHOD_NOT_ALLOWED", error: "Use POST to ask a question." });
   }
 
   const question = typeof req.body?.q === "string" ? req.body.q.trim() : "";
   if (!question) {
-    return res.status(400).json({ error: "Enter a question before sending." });
+    return res.status(400).json({ code: "QUESTION_EMPTY", error: "Enter a question before sending." });
   }
   if (question.length > 500) {
-    return res.status(413).json({ error: "Please keep your question under 500 characters." });
+    return res.status(413).json({ code: "QUESTION_TOO_LONG", error: "Please keep your question under 500 characters." });
   }
   if (!process.env.GROQ_API_KEY) {
-    return res.status(503).json({ error: "I’m not able to answer right now. Please try again later." });
+    return res.status(503).json({ code: "CONFIG_MISSING", error: "I’m not able to answer right now. Please try again later." });
   }
 
   try {
@@ -27,7 +27,7 @@ export default async function handler(req, res) {
       signal: AbortSignal.timeout(20000),
       body: JSON.stringify({
         model: MODEL,
-        max_tokens: 300,
+        max_completion_tokens: 300,
         temperature: 0.6,
         messages: [
           { role: "system", content: SYSTEM_PROMPT },
@@ -37,28 +37,40 @@ export default async function handler(req, res) {
     });
 
     if (!upstream.ok) {
+      const providerPayload = await upstream.json().catch(() => ({}));
+      const providerDetail = typeof providerPayload?.error?.message === "string"
+        ? providerPayload.error.message.replace(/gsk_[A-Za-z0-9_-]+/g, "[redacted]").slice(0, 180)
+        : undefined;
+      if (upstream.status === 400) {
+        console.error(`[api/chat] Groq rejected the request (HTTP ${upstream.status}).`);
+        return res.status(502).json({ code: "GROQ_BAD_REQUEST", error: "Groq rejected the chat request.", detail: providerDetail });
+      }
       if (upstream.status === 429) {
-        return res.status(429).json({ error: "I’ve reached my current response limit. Please wait a little and ask me again." });
+        console.error(`[api/chat] Groq rate limit (HTTP ${upstream.status}).`);
+        return res.status(429).json({ code: "GROQ_RATE_LIMITED", error: "I’ve reached my current response limit. Please wait a little and ask me again." });
       }
       if (upstream.status === 401 || upstream.status === 403) {
-        return res.status(502).json({ error: "I can’t reach my AI service right now. Please check the server configuration and try again." });
+        console.error(`[api/chat] Groq authentication/permission failure (HTTP ${upstream.status}).`);
+        return res.status(502).json({ code: "GROQ_AUTH_FAILED", error: "I can’t reach my AI service right now. Please check the server configuration and try again." });
       }
       if (upstream.status === 404) {
-        return res.status(502).json({ error: "My response model isn’t available right now. Please try again later." });
+        console.error(`[api/chat] Groq model/endpoint not found (HTTP ${upstream.status}).`);
+        return res.status(502).json({ code: "GROQ_MODEL_NOT_FOUND", error: "My response model isn’t available right now. Please try again later." });
       }
-      return res.status(502).json({ error: "I can’t respond right now because my AI service is temporarily unavailable. Please try again shortly." });
+      console.error(`[api/chat] Groq upstream failure (HTTP ${upstream.status}).`);
+      return res.status(502).json({ code: `GROQ_HTTP_${upstream.status}`, error: "I can’t respond right now because my AI service is temporarily unavailable. Please try again shortly.", detail: providerDetail });
     }
 
     const payload = await upstream.json();
     const text = payload?.choices?.[0]?.message?.content;
     if (typeof text !== "string" || !text.trim()) {
-      return res.status(502).json({ error: "I couldn’t form an answer just now. Please ask me again." });
+      return res.status(502).json({ code: "GROQ_EMPTY_RESPONSE", error: "I couldn’t form an answer just now. Please ask me again." });
     }
     return res.status(200).json({ text: text.trim() });
   } catch (error) {
     if (error?.name === "TimeoutError" || error?.name === "AbortError") {
-      return res.status(504).json({ error: "I took too long to put that answer together. Please try again." });
+      return res.status(504).json({ code: "GROQ_TIMEOUT", error: "I took too long to put that answer together. Please try again." });
     }
-    return res.status(502).json({ error: "I can’t reach my response service right now. Please try again shortly." });
+    return res.status(502).json({ code: "GROQ_NETWORK_ERROR", error: "I can’t reach my response service right now. Please try again shortly." });
   }
 }
